@@ -1,0 +1,16 @@
+[Unit]
+Description=Defect Detector Firestore Listener
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=test
+WorkingDirectory=/home/test/Tazowa
+ExecStart=/home/test/miniconda3/bin/python /home/test/Tazowa/listener.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
