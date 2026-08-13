@@ -1,36 +1,23 @@
-
 """
-kafka_consumer.py
-===================
-Always-running service. Subscribes to the Kafka topic that receives one
-message per newly-created threeSixtyImages doc (published by
-cloud_function/main.py). For each message:
-  1. Confirms the image's milestone is currently active (status == 1) --
-     same rule as the batch script.
-  2. Confirms processedByAI is still false (belt-and-suspenders, in case
-     of a duplicate/replayed Kafka message).
-  3. Assigns/reuses a MilestoneCodeN for this milestone via the SAME
-     persistent mapping file the batch script uses (MilestoneCodeMapper,
-     shared in defect_pipeline.py) -- NOT a manually-maintained dict.
-     Whichever script (this one, or the batch script) sees a given
-     milestone ID first assigns it the next code; the other reuses it.
-  4. Resolves that code to a detection rule-set (MilestoneCode1 -> MS001,
-     MilestoneCode2 -> MS002, ...). Skips (with a clear log line) if no
-     matching rule is defined yet.
-  5. Downloads the image, resizes, dedups (persists for the life of this
-     process, scoped per rule), calls Gemini, converts boxes to pixel +
-     longitude/latitude, draws them, saves the annotated image.
-  6. Writes processedByAI = true AND the hotspotAI companion doc in a
-     single atomic Firestore batch (mark_processed_and_store_hotspot,
-     shared with the batch script) -- ONLY after full success.
-  7. Appends to a running JSON report, and optionally publishes the
-     result onto a second Kafka topic.
+consumer.py
+=============
+Always-running service. Subscribes to Kafka, and for every event
+published by listener.py:
+  1. Confirms the image's milestone is currently active (status == 1).
+  2. Confirms processedByAI is still false (in case of a duplicate/
+     replayed message).
+  3. Assigns/reuses a MilestoneCodeN via the shared persistent mapping
+     file (MilestoneCodeMapper, in defect_pipeline.py).
+  4. Resolves that code to a detection rule-set (MilestoneCode1 -> MS001, ...).
+  5. Downloads the image, resizes, dedups, calls Gemini, converts boxes
+     to pixel + longitude/latitude, draws them, saves the annotated image.
+  6. Writes processedByAI = true AND the hotspotAI companion doc in one
+     atomic Firestore batch -- ONLY after full success.
 
-Run with:  python3 kafka_consumer.py
+Run with:  python3 consumer.py
 
-This process needs to stay running permanently. For production run it
-under systemd, Docker with --restart unless-stopped, or Cloud Run with
-min-instances=1 (NOT a Cloud Function).
+Must run permanently. In production: deploy as its own Cloud Run service
+with --no-cpu-throttling (see README_KAFKA_GCE.md).
 """
 
 import os
@@ -45,19 +32,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from PIL import Image
-from kafka import KafkaConsumer, KafkaProducer
+from kafka import KafkaConsumer
 
 import defect_pipeline as dp
 
-# ============================================================
-# CONFIG - loaded from .env
-# ============================================================
-
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 NEW_IMAGE_TOPIC = os.getenv("KAFKA_NEW_IMAGE_TOPIC", "new-image-events")
-RESULTS_TOPIC = os.getenv("KAFKA_RESULTS_TOPIC", "defect-results")
-PUBLISH_RESULTS = os.getenv("KAFKA_PUBLISH_RESULTS", "false").lower() == "true"
-
 KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 
@@ -66,15 +46,8 @@ STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 ACTIVE_STATUS_VALUE = 1
-
-# SAME default filename as the batch script -- as long as both scripts run
-# from the same working directory, they share one mapping file and stay
-# in sync automatically. Override via env var if you keep them in
-# different folders.
 MILESTONE_CODE_MAP_PATH = os.getenv("MILESTONE_CODE_MAP_PATH", "milestone_code_map.json")
-
 OUTPUT_DIR = "batch_defect_outputs"
-RUNNING_REPORT_PATH = os.path.join(OUTPUT_DIR, "streaming_report.json")
 
 
 def kafka_connection_kwargs() -> dict:
@@ -104,10 +77,6 @@ def validate_config():
         raise SystemExit(1)
 
 
-# ============================================================
-# Firebase (Firestore + Storage)
-# ============================================================
-
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
@@ -118,8 +87,6 @@ def init_firebase():
             cred = credentials.Certificate(SERVICE_ACCOUNT_KEY_PATH)
             firebase_admin.initialize_app(cred, {"storageBucket": STORAGE_BUCKET})
         else:
-            # Cloud Run / GCP: use the service's own identity instead of a
-            # key file baked into the container.
             firebase_admin.initialize_app(options={"storageBucket": STORAGE_BUCKET})
     return firestore.client(), storage.bucket()
 
@@ -152,33 +119,7 @@ def is_milestone_active(db, company_id, project_id, milestone_id) -> bool:
     return snap.to_dict().get("status") == ACTIVE_STATUS_VALUE
 
 
-# ============================================================
-# Running JSON report (appended to as messages are processed)
-# ============================================================
-
-def append_to_report(doc_id: str, file_path: str, milestone_id: str, milestone_code: str, rule_id: str, result: dict):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    if os.path.exists(RUNNING_REPORT_PATH):
-        with open(RUNNING_REPORT_PATH, "r") as f:
-            report = json.load(f)
-    else:
-        report = {}
-    report[doc_id] = {
-        "file_path": file_path,
-        "milestone_id": milestone_id,
-        "milestone_code": milestone_code,
-        "rule_id": rule_id,
-        "result": result,
-    }
-    with open(RUNNING_REPORT_PATH, "w") as f:
-        json.dump(report, f, indent=2)
-
-
-# ============================================================
-# Main consume loop
-# ============================================================
-
-def process_message(db, bucket, producer, mapper, fingerprint_cache, msg: dict):
+def process_message(db, bucket, mapper, fingerprint_cache, msg: dict):
     doc_id = msg.get("doc_id")
     file_path = msg.get("file_path")
     milestone_id = msg.get("milestone_id")
@@ -189,28 +130,34 @@ def process_message(db, bucket, producer, mapper, fingerprint_cache, msg: dict):
         print(f"  skipping message, missing required field(s): {msg}")
         return
 
+    print(f"  [1/5] checking milestone active status...", flush=True)
     if not is_milestone_active(db, company_id, project_id, milestone_id):
         print(f"  skipping {doc_id}: milestone '{milestone_id}' is not currently active (status != {ACTIVE_STATUS_VALUE})")
         return
+    print(f"  [1/5] done -- milestone is active", flush=True)
 
-    # Reload before each use: picks up any codes assigned by the batch
-    # script (or another consumer instance) since this process started.
+    print(f"  [2/5] resolving milestone code / rule...", flush=True)
     mapper.reload()
     milestone_code = mapper.get_or_assign(milestone_id)
     rule_id = dp.resolve_rule_id(milestone_code)
     if rule_id is None:
         print(f"  skipping {doc_id}: milestone '{milestone_id}' -> {milestone_code} has no MS0xx rule defined yet")
         return
+    print(f"  [2/5] done -- {milestone_code} -> {rule_id}", flush=True)
 
+    print(f"  [3/5] checking if already processed...", flush=True)
     image_ref = get_image_doc_ref(db, company_id, project_id, doc_id)
     current = image_ref.get()
     if current.exists and current.to_dict().get("processedByAI"):
         print(f"  skipping {doc_id}: already processedByAI = true")
         return
+    print(f"  [3/5] done -- not yet processed", flush=True)
 
+    print(f"  [4/5] downloading image from Storage...", flush=True)
     print(f"  processing {doc_id} ({file_path}) -> {milestone_code} -> {rule_id} ...", end=" ", flush=True)
     try:
         content = download_image_bytes(bucket, file_path)
+        print(f"\n  [4/5] done -- downloaded {len(content)} bytes", flush=True)
         orig_image = Image.open(io.BytesIO(content)).convert("RGB")
         orig_w, orig_h = orig_image.size
 
@@ -222,7 +169,9 @@ def process_message(db, bucket, producer, mapper, fingerprint_cache, msg: dict):
             source_doc_id, normalized = fingerprint_cache[cache_key]
             duplicate_of = source_doc_id
         else:
+            print(f"  [5/5] calling Gemini API...", flush=True)
             normalized = dp.get_defects_normalized(small, rule_id, GEMINI_API_KEY)
+            print(f"  [5/5] done -- Gemini responded", flush=True)
             fingerprint_cache[cache_key] = (doc_id, normalized)
             duplicate_of = None
 
@@ -230,11 +179,8 @@ def process_message(db, bucket, producer, mapper, fingerprint_cache, msg: dict):
         annotated = dp.draw_defects(orig_image, result["defects"])
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        out_img_path = os.path.join(OUTPUT_DIR, f"annotated_{rule_id}_{doc_id}.jpg")
-        annotated.save(out_img_path)
+        annotated.save(os.path.join(OUTPUT_DIR, f"annotated_{rule_id}_{doc_id}.jpg"))
 
-        # Atomic write: processedByAI=true + hotspotAI doc together, or
-        # neither -- same shared function the batch script uses.
         dp.mark_processed_and_store_hotspot(
             db, image_ref, company_id, project_id,
             milestone_id, milestone_code, rule_id, file_path, result,
@@ -242,21 +188,6 @@ def process_message(db, bucket, producer, mapper, fingerprint_cache, msg: dict):
 
         n_defects = len(result["defects"])
         print(f"done ({n_defects} defect(s)), processedByAI=true" + (f" [dup of {duplicate_of}]" if duplicate_of else ""))
-
-        append_to_report(doc_id, file_path, milestone_id, milestone_code, rule_id, result)
-
-        if PUBLISH_RESULTS and producer is not None:
-            producer.send(RESULTS_TOPIC, {
-                "doc_id": doc_id,
-                "file_path": file_path,
-                "milestone_id": milestone_id,
-                "milestone_code": milestone_code,
-                "rule_id": rule_id,
-                "defects": result["defects"],
-                "summary": result["summary"],
-                "duplicate_of": duplicate_of,
-            })
-            producer.flush()
 
     except Exception as e:
         print(f"FAILED: {e}")
@@ -279,23 +210,16 @@ def main():
         **kafka_connection_kwargs(),
     )
 
-    producer = None
-    if PUBLISH_RESULTS:
-        producer = KafkaProducer(
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            **kafka_connection_kwargs(),
-        )
-
     print("Connecting to Firebase...")
     db, bucket = init_firebase()
 
     print(f"Listening on topic '{NEW_IMAGE_TOPIC}'. Waiting for messages... (Ctrl+C to stop)\n")
 
-    fingerprint_cache = {}  # (rule_id, fingerprint) -> (doc_id, normalized_result)
+    fingerprint_cache = {}
 
     for message in consumer:
         print(f"Received message: {message.value}")
-        process_message(db, bucket, producer, mapper, fingerprint_cache, message.value)
+        process_message(db, bucket, mapper, fingerprint_cache, message.value)
         print()
 
 
